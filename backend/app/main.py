@@ -1,13 +1,21 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+import google.generativeai as genai
 import os
 
 load_dotenv()
 
+# Configure Gemini
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=GEMINI_API_KEY)
+
+# Initialize Gemini model
+model = genai.GenerativeModel("gemini-2.5-flash")
+
 app = FastAPI(title="RAG Gemini Backend")
 
-# Allow frontend to connect
+# Allow frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,8 +28,16 @@ app.add_middleware(
 def root():
     return {"message": "RAG Backend Running!"}
 
-# Temporary test endpoint for PDF upload
-# (we will implement real processing in Part 4)
 @app.post("/upload_pdf")
 async def upload_pdf(file: UploadFile = File(...)):
     return {"filename": file.filename, "status": "received"}
+
+@app.post("/query")
+def query_gemini(payload: dict):
+    prompt = payload.get("prompt", "")
+
+    try:
+        response = model.generate_content(prompt)
+        return {"response": response.text}
+    except Exception as e:
+        return {"error": str(e)}
