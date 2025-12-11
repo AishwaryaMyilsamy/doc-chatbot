@@ -1,13 +1,19 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
 import google.generativeai as genai
 import os
 
-import shutil
-from app.pdf_utils import extract_text_from_pdf, chunk_text
-
+from dotenv import load_dotenv
 load_dotenv()
+
+import shutil
+import uuid
+from app.pdf_utils import extract_text_from_pdf, chunk_text
+from app.embeddings import get_embedding
+from app.pinecone_client import index
+
+
+
 
 # Configure Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -38,22 +44,38 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 @app.post("/upload_pdf")
 async def upload_pdf(file: UploadFile = File(...)):
     """
-    Save PDF, extract text, split into chunks.
+    Upload PDF → extract → chunk → embed → upsert to Pinecone
     """
     file_path = os.path.join(UPLOAD_DIR, file.filename)
-    # Save uploaded PDF
+
+    # Save PDF
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Extract text
-    full_text = extract_text_from_pdf(file_path)
-    chunks = chunk_text(full_text, chunk_size=500, overlap=50)
+    # Extract + chunk
+    text = extract_text_from_pdf(file_path)
+    chunks = chunk_text(text, chunk_size=500, overlap=50)
+
+    # Build Pinecone vectors
+    vectors = []
+    for i, chunk in enumerate(chunks):
+        embedding = get_embedding(chunk)  # 1024 dims
+        vectors.append({
+            "id": str(uuid.uuid4()),
+            "values": embedding,
+            "metadata": {
+                "source": file.filename,
+                "chunk_id": i
+            }
+        })
+
+    # Upsert into Pinecone
+    index.upsert(vectors)
 
     return {
         "filename": file.filename,
-        "status": "processed",
         "num_chunks": len(chunks),
-        "sample_chunk": chunks[0] if chunks else ""
+        "status": "Successfully embedded and stored in Pinecone!"
     }
 
 
