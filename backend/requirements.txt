@@ -5,5 +5,5 @@ pydantic
 python-multipart
 pypdf
 sentence-transformers
-pinecone-client
+pinecone
 google-generativeai
