@@ -61,11 +61,12 @@ async def upload_pdf(file: UploadFile = File(...)):
     for i, chunk in enumerate(chunks):
         embedding = get_embedding(chunk)  # 1024 dims
         vectors.append({
-            "id": str(uuid.uuid4()),
+            "id": f"{file.filename}-{i}",
             "values": embedding,
             "metadata": {
-                "source": file.filename,
-                "chunk_id": i
+                "text": chunk,       
+                "chunk_id": i,
+                "source": file.filename
             }
         })
 
@@ -79,12 +80,32 @@ async def upload_pdf(file: UploadFile = File(...)):
     }
 
 
-@app.post("/query")
-def query_gemini(payload: dict):
-    prompt = payload.get("prompt", "")
+from app.embeddings import get_embedding
+from app.pinecone_client import index
 
-    try:
-        response = model.generate_content(prompt)
-        return {"response": response.text}
-    except Exception as e:
-        return {"error": str(e)}
+@app.post("/rag_query")
+def rag_query(payload: dict):
+    query_text = payload.get("query", "")
+
+    # 1. Create embedding for query
+    query_embedding = get_embedding(query_text)
+
+    # 2. Search Pinecone
+    search_results = index.query(
+        vector=query_embedding,
+        top_k=5,
+        include_metadata=True
+    )
+
+    # 3. Build context string
+    context = "\n".join([m["metadata"]["text"] for m in search_results.matches])
+
+    # 4. Ask Gemini
+    final_prompt = f"Use ONLY the context below to answer.\n\nContext:\n{context}\n\nQuestion: {query_text}"
+
+    response = model.generate_content(final_prompt)
+
+    return {
+        "context_used": context,
+        "answer": response.text
+    }
