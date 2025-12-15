@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Body, Form
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
 import os
@@ -42,70 +42,152 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @app.post("/upload_pdf")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(
+    file: UploadFile = File(...),
+    session_id: str = Form(...)
+):
     """
     Upload PDF → extract → chunk → embed → upsert to Pinecone
+    Linked to ONE session_id
     """
+
     file_path = os.path.join(UPLOAD_DIR, file.filename)
 
-    # Save PDF
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Extract + chunk
     text = extract_text_from_pdf(file_path)
     chunks = chunk_text(text, chunk_size=500, overlap=50)
 
-    # Build Pinecone vectors
     vectors = []
     for i, chunk in enumerate(chunks):
-        embedding = get_embedding(chunk)  # 1024 dims
+        embedding = get_embedding(chunk)
+
         vectors.append({
-            "id": f"{file.filename}-{i}",
+            "id": f"{session_id}-{i}",   
             "values": embedding,
             "metadata": {
-                "text": chunk,       
+                "text": chunk,
                 "chunk_id": i,
-                "source": file.filename
+                "source": file.filename,
+                "session_id": session_id 
             }
         })
 
-    # Upsert into Pinecone
     index.upsert(vectors)
 
     return {
+        "session_id": session_id,
         "filename": file.filename,
-        "num_chunks": len(chunks),
-        "status": "Successfully embedded and stored in Pinecone!"
+        "chunks_stored": len(chunks)
     }
 
 
 from app.embeddings import get_embedding
 from app.pinecone_client import index
 
-@app.post("/rag_query")
-def rag_query(payload: dict):
-    query_text = payload.get("query", "")
+@app.post("/query")
+def query_pdf(payload: dict = Body(...)):
+    """
+    Query PDF content using session_id filtering
+    Supports follow-up questions with intelligent rewriting
+    """
 
-    # 1. Create embedding for query
-    query_embedding = get_embedding(query_text)
+    session_id = payload.get("session_id")
+    question = payload.get("question")
+    is_followup = payload.get("is_followup", False)
+    previous_answer = payload.get("previous_answer", "")
 
-    # 2. Search Pinecone
-    search_results = index.query(
+    if not session_id or not question:
+        return {"error": "session_id and question are required"}
+
+    # --------------------------------------------------
+    # Step 1: Decide retrieval query
+    # --------------------------------------------------
+
+    if is_followup and previous_answer:
+        rewrite_prompt = f"""
+        You are a query-rewriting assistant.
+        Your task is to rewrite a follow-up question into a clear and search-optimized standalone question.
+
+        You will be provided with the previous answer and the follow-up question.
+
+        Instructions:
+        1. Infer the missing keyword in the follow-up question using the previous answer (not the whole context of the answer).
+        2. Resolve vague references (e.g., "above", "this", "2nd point", "that").
+        3. Rewrite the question so it can be understood without seeing the previous answer.
+        4. Preserve the original intent and scope of the follow-up question.
+        5. Do NOT answer the question.
+        6. Output ONLY the rewritten standalone question.
+
+
+        Inputs:
+        - Previous answer: {previous_answer}
+        - Follow-up question: {question}
+        """
+
+        retrieval_query = model.generate_content(
+            rewrite_prompt
+        ).text.strip()
+
+    else:
+        # First question → no rewrite
+        retrieval_query = question
+
+    # --------------------------------------------------
+    # Step 2: Embed retrieval query
+    # --------------------------------------------------
+
+    query_embedding = get_embedding(retrieval_query)
+
+    # --------------------------------------------------
+    # Step 3: Pinecone query (session-scoped)
+    # --------------------------------------------------
+
+    results = index.query(
         vector=query_embedding,
         top_k=5,
-        include_metadata=True
+        include_metadata=True,
+        filter={
+            "session_id": {"$eq": session_id}
+        }
     )
 
-    # 3. Build context string
-    context = "\n".join([m["metadata"]["text"] for m in search_results.matches])
+    if not results.matches:
+        return {
+            "answer": "I don't know",
+            "retrieval_query": retrieval_query
+        }
 
-    # 4. Ask Gemini
-    final_prompt = f"Use ONLY the context below to answer.\n\nContext:\n{context}\n\nQuestion: {query_text}"
+    # --------------------------------------------------
+    # Step 4: Build context
+    # --------------------------------------------------
 
-    response = model.generate_content(final_prompt)
+    context = "\n\n".join(
+        match.metadata["text"] for match in results.matches
+    )
+
+    # --------------------------------------------------
+    # Step 5: Answer using Gemini
+    # --------------------------------------------------
+
+    answer_prompt = f"""
+    You are an assistant answering questions ONLY using the context below.
+    If the answer is not present, say "I don't know".
+
+    Context:
+    {context}
+
+    Question:
+    {question}
+    """
+
+    answer = model.generate_content(answer_prompt).text.strip()
 
     return {
-        "context_used": context,
-        "answer": response.text
+        "session_id": session_id,
+        "question": question,
+        "is_followup": is_followup,
+        "retrieval_query": retrieval_query,
+        "answer": answer
     }
