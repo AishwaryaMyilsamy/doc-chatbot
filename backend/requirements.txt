@@ -1,9 +1,0 @@
-fastapi
-uvicorn
-python-dotenv
-pydantic
-python-multipart
-pypdf
-sentence-transformers
-pinecone
-google-generativeai
